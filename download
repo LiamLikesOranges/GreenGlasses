@@ -1,0 +1,63 @@
+"""
+Prepares training data for greenglasses.
+
+By default, downloads the "Tiny Shakespeare" corpus (~1MB of plain text,
+a classic small dataset for exactly this kind of experiment). If you
+already have your own input.txt in this folder, pass --skip-download to
+use it as-is instead.
+"""
+
+import argparse
+import os
+
+import requests
+
+THIS_DIR = os.path.dirname(__file__)
+INPUT_PATH = os.path.join(THIS_DIR, "input.txt")
+
+TINY_SHAKESPEARE_URL = (
+    "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+)
+
+
+def download_default_corpus():
+    print(f"Downloading default corpus from {TINY_SHAKESPEARE_URL} ...")
+    resp = requests.get(TINY_SHAKESPEARE_URL, timeout=30)
+    resp.raise_for_status()
+    with open(INPUT_PATH, "w", encoding="utf-8") as f:
+        f.write(resp.text)
+    print(f"Saved {len(resp.text):,} characters to {INPUT_PATH}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Prepare training data for greenglasses")
+    parser.add_argument(
+        "--skip-download",
+        action="store_true",
+        help="Don't download anything; use the existing data/input.txt as-is.",
+    )
+    args = parser.parse_args()
+
+    if args.skip_download:
+        if not os.path.exists(INPUT_PATH):
+            raise FileNotFoundError(
+                f"--skip-download was passed but {INPUT_PATH} doesn't exist. "
+                "Put your own text file there first."
+            )
+        print(f"Using existing file at {INPUT_PATH}")
+    else:
+        download_default_corpus()
+
+    with open(INPUT_PATH, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    vocab = sorted(set(text))
+    print(f"\nDataset stats:")
+    print(f"  total characters: {len(text):,}")
+    print(f"  unique characters (vocab size): {len(vocab)}")
+    print(f"  vocab: {''.join(vocab)!r}")
+    print("\nReady. Next step: python train.py")
+
+
+if __name__ == "__main__":
+    main()
