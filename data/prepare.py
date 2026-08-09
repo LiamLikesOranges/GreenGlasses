@@ -52,24 +52,113 @@ By any other name would smell as sweet.
 
 
 def download_default_corpus():
+    """Downloads with a hard, unignorable timeout, streaming in chunks so
+    real progress can be reported (prints DOWNLOAD_PROGRESS:<percent>
+    lines that gui.py parses into an actual progress bar).
+
+    Some networks (corporate proxies, firewalls, VPNs) can cause a
+    connection to hang at the OS level in a way Python can't interrupt
+    from the outside. To guarantee this function never hangs forever, the
+    actual request runs in a daemon thread: we wait up to
+    HARD_TIMEOUT_SECONDS for it, and if it's still stuck, we give up and
+    move on — the daemon thread gets silently abandoned (and cleaned up
+    whenever the process eventually exits) instead of blocking this
+    script."""
+    import threading
     import requests
 
-    print(f"Downloading default corpus from {TINY_SHAKESPEARE_URL} ...")
-    resp = requests.get(TINY_SHAKESPEARE_URL, timeout=15)
-    resp.raise_for_status()
-    if len(resp.text) < 1000:
-        raise ValueError(f"Downloaded file looks too small ({len(resp.text)} chars) — treating as failed.")
+    HARD_TIMEOUT_SECONDS = 20
+    result = {}
+
+    def _worker():
+        try:
+            # (connect_timeout, read_timeout) — separate so a slow-but-alive
+            # connection can't quietly stall past a single combined timeout.
+            resp = requests.get(TINY_SHAKESPEARE_URL, timeout=(5, 8), stream=True)
+            resp.raise_for_status()
+
+            total = resp.headers.get("Content-Length")
+            total = int(total) if total is not None else None
+
+            # Read raw (still-compressed) bytes rather than
+            # resp.iter_content()'s auto-decompressed bytes. GitHub serves
+            # this file gzip-compressed, so Content-Length reflects the
+            # *compressed* size — tracking decompressed bytes against that
+            # header would blow past 100% before the download is actually
+            # done. decode_content=False keeps what we count in sync with
+            # what Content-Length promised.
+            chunks = []
+            downloaded = 0
+            last_reported_percent = -1
+
+            for chunk in resp.raw.stream(8192, decode_content=False):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                downloaded += len(chunk)
+
+                if total:
+                    percent = min(100.0, downloaded / total * 100)
+                    # only print when the whole percent changes, so we
+                    # don't flood the log with hundreds of lines
+                    if int(percent) != last_reported_percent:
+                        last_reported_percent = int(percent)
+                        print(f"DOWNLOAD_PROGRESS:{percent:.1f}", flush=True)
+                else:
+                    # server didn't send a size — report bytes instead so
+                    # there's still visible movement, just not a percent
+                    print(f"DOWNLOAD_BYTES:{downloaded}", flush=True)
+
+            raw_bytes = b"".join(chunks)
+            encoding = (resp.headers.get("Content-Encoding") or "").lower()
+            if encoding == "gzip":
+                import gzip
+                raw_bytes = gzip.decompress(raw_bytes)
+            elif encoding == "deflate":
+                import zlib
+                raw_bytes = zlib.decompress(raw_bytes)
+            # (anything else — identity/br/unsupported — is used as-is;
+            # br is rare for plain-text GitHub responses)
+
+            result["text"] = raw_bytes.decode("utf-8", errors="replace")
+        except Exception as e:
+            result["error"] = e
+
+    print(f"Downloading default corpus from {TINY_SHAKESPEARE_URL} ...", flush=True)
+    print(f"(will give up after {HARD_TIMEOUT_SECONDS}s and use a built-in sample instead)", flush=True)
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    thread.join(timeout=HARD_TIMEOUT_SECONDS)
+
+    if thread.is_alive():
+        # Still stuck. We can't force-kill a thread in Python, but because
+        # it's a daemon thread it won't stop this script from continuing
+        # or from exiting later — we just stop waiting on it here.
+        raise TimeoutError(
+            f"Download did not respond within {HARD_TIMEOUT_SECONDS}s "
+            "(likely blocked by a firewall/proxy)."
+        )
+
+    if "error" in result:
+        raise result["error"]
+
+    text = result["text"]
+    if len(text) < 1000:
+        raise ValueError(f"Downloaded file looks too small ({len(text)} chars) — treating as failed.")
+
     with open(INPUT_PATH, "w", encoding="utf-8") as f:
-        f.write(resp.text)
-    print(f"Saved {len(resp.text):,} characters to {INPUT_PATH}")
+        f.write(text)
+    print("DOWNLOAD_PROGRESS:100.0", flush=True)
+    print(f"Saved {len(text):,} characters to {INPUT_PATH}", flush=True)
 
 
 def write_fallback_corpus():
-    print("Falling back to a small built-in sample text instead (no internet needed).")
+    print("Falling back to a small built-in sample text instead (no internet needed).", flush=True)
     with open(INPUT_PATH, "w", encoding="utf-8") as f:
         f.write(FALLBACK_TEXT)
-    print(f"Saved {len(FALLBACK_TEXT):,} characters to {INPUT_PATH}")
-    print("(This is a tiny placeholder — swap in your own data/input.txt for real training.)")
+    print(f"Saved {len(FALLBACK_TEXT):,} characters to {INPUT_PATH}", flush=True)
+    print("(This is a tiny placeholder — swap in your own data/input.txt for real training.)", flush=True)
 
 
 def main():
@@ -87,12 +176,12 @@ def main():
                 f"--skip-download was passed but {INPUT_PATH} doesn't exist. "
                 "Put your own text file there first."
             )
-        print(f"Using existing file at {INPUT_PATH}")
+        print(f"Using existing file at {INPUT_PATH}", flush=True)
     else:
         try:
             download_default_corpus()
         except Exception as e:
-            print(f"\n[prepare] Download failed: {e}")
+            print(f"\n[prepare] Download failed: {e}", flush=True)
             write_fallback_corpus()
 
     if not os.path.exists(INPUT_PATH):
@@ -104,12 +193,12 @@ def main():
         text = f.read()
 
     vocab = sorted(set(text))
-    print(f"\nDataset stats:")
-    print(f"  file: {INPUT_PATH}")
-    print(f"  total characters: {len(text):,}")
-    print(f"  unique characters (vocab size): {len(vocab)}")
-    print(f"  vocab: {''.join(vocab)!r}")
-    print("\nReady. Next step: python train.py")
+    print(f"\nDataset stats:", flush=True)
+    print(f"  file: {INPUT_PATH}", flush=True)
+    print(f"  total characters: {len(text):,}", flush=True)
+    print(f"  unique characters (vocab size): {len(vocab)}", flush=True)
+    print(f"  vocab: {''.join(vocab)!r}", flush=True)
+    print("\nReady. Next step: python train.py", flush=True)
 
 
 if __name__ == "__main__":

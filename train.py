@@ -1,17 +1,25 @@
 """
-Trains the greenglasses model on data/input.txt and saves a checkpoint.
+Trains the greenglasses model on data/input.txt and saves it as its own
+folder under models/, e.g. models/GreenGlasses-v1-0.8M/.
 
 Run `python data/prepare.py` first if you haven't already.
+
+Usage:
+    python train.py                                  # default name "GreenGlasses"
+    python train.py --name "ShakespeareBot"            # custom name
+    python train.py --description "Trained on my journal entries"
 """
 
+import argparse
 import os
 import time
 
 import torch
 
 import config
+import model_registry
 from model import GreenGlassesGPT
-from tokenizer import CharTokenizer, tokenizer_path_for
+from tokenizer import CharTokenizer
 
 
 def get_device():
@@ -45,6 +53,19 @@ def estimate_loss(model, train_data, val_data, block_size, batch_size, eval_iter
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Train a greenglasses model")
+    parser.add_argument(
+        "--name", type=str, default=config.MODEL_NAME,
+        help=f"Base name for this model (default: {config.MODEL_NAME}). "
+             f"Each run with the same name gets its own version, e.g. "
+             f"{config.MODEL_NAME}-v1-0.8M, {config.MODEL_NAME}-v2-0.8M, ...",
+    )
+    parser.add_argument(
+        "--description", type=str, default=None,
+        help="Optional free-text description saved with the model.",
+    )
+    args = parser.parse_args()
+
     torch.manual_seed(config.SEED)
     device = get_device()
     print(f"Using device: {device}")
@@ -73,12 +94,31 @@ def main():
         block_size=config.BLOCK_SIZE,
         dropout=config.DROPOUT,
     ).to(device)
-    print(f"Model parameters: {model.num_params():,}")
+    num_params = model.num_params()
+    print(f"Model parameters: {num_params:,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE)
 
-    os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
-    tokenizer.save(tokenizer_path_for(config.CHECKPOINT_DIR))
+    # decide this run's folder name up front — parameter count is fixed by
+    # the architecture, known before training starts, and the version
+    # number is picked once so every save this run goes to the same place
+    version = model_registry.next_version(config.MODELS_DIR, args.name)
+    folder_name = model_registry.make_model_folder_name(args.name, version, num_params)
+    folder_path = os.path.join(config.MODELS_DIR, folder_name)
+    os.makedirs(folder_path, exist_ok=True)
+    print(f"Saving this run to: models/{folder_name}")
+
+    model_path = os.path.join(folder_path, "model.pt")
+    tokenizer.save(os.path.join(folder_path, "tokenizer.json"))
+
+    model_config = {
+        "vocab_size": tokenizer.vocab_size,
+        "n_embed": config.N_EMBED,
+        "n_head": config.N_HEAD,
+        "n_layer": config.N_LAYER,
+        "block_size": config.BLOCK_SIZE,
+        "dropout": config.DROPOUT,
+    }
 
     start = time.time()
     for it in range(1, config.MAX_ITERS + 1):
@@ -101,23 +141,23 @@ def main():
                 f"val loss {losses['val']:.4f} | {elapsed:.1f}s elapsed"
             )
             torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "config": {
-                        "vocab_size": tokenizer.vocab_size,
-                        "n_embed": config.N_EMBED,
-                        "n_head": config.N_HEAD,
-                        "n_layer": config.N_LAYER,
-                        "block_size": config.BLOCK_SIZE,
-                        "dropout": config.DROPOUT,
-                    },
-                    "iter": it,
-                },
-                config.CHECKPOINT_PATH,
+                {"model_state_dict": model.state_dict(), "config": model_config, "iter": it},
+                model_path,
+            )
+            model_registry.save_model_info(
+                folder_path,
+                name=args.name,
+                version=version,
+                num_params=num_params,
+                iteration=it,
+                max_iters=config.MAX_ITERS,
+                model_config=model_config,
+                description=args.description,
+                dataset_chars=len(text),
             )
 
-    print(f"\nDone. Checkpoint saved to {config.CHECKPOINT_PATH}")
-    print("Generate text with: python sample.py --prompt \"Once upon a time\"")
+    print(f"\nDone. Model saved to models/{folder_name}")
+    print(f"Generate text with: python sample.py --model \"{folder_name}\" --prompt \"Once upon a time\"")
 
 
 if __name__ == "__main__":

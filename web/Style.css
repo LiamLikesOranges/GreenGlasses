@@ -198,13 +198,61 @@ html, body {
 
 /* ---------- log console ---------- */
 
+.model-section {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.model-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.model-list {
+  flex: 1;
+  background: var(--accent-dark);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 12px;
+  overflow-y: auto;
+  display: grid;
+  gap: 10px;
+}
+
+.model-details {
+  flex: 1;
+  background: var(--accent-dark);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 14px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-y: auto;
+}
+
 .log-section {
   flex: 1;
   min-height: 0;
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
 }
 
-.log {
+.log-block {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.log-block h2 {
+  margin: 0 0 10px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
   flex: 1;
   margin: 0;
   background: var(--accent-dark);

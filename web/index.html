@@ -27,11 +27,30 @@
       <button id="btn-train" class="btn btn-secondary">2. Train</button>
       <button id="btn-sample" class="btn btn-secondary">3. Generate Sample</button>
       <button id="btn-all" class="btn btn-primary">Run Full Pipeline</button>
+      <button id="btn-refresh-models" class="btn btn-secondary">Refresh Models</button>
       <button id="btn-stop" class="btn btn-danger" disabled>Stop</button>
     </section>
 
+    <section class="model-section">
+      <div class="model-panel">
+        <h2>Trained Models</h2>
+        <div id="model-list" class="model-list"></div>
+      </div>
+      <div class="model-panel">
+        <h2>Model Details</h2>
+        <pre id="model-details" class="model-details"></pre>
+      </div>
+    </section>
+
     <section class="log-section">
-      <pre id="log" class="log"></pre>
+      <div class="log-block">
+        <h2>Pipeline Log</h2>
+        <pre id="log" class="log"></pre>
+      </div>
+      <div class="log-block">
+        <h2>Dev Log</h2>
+        <pre id="dev-log" class="log dev-log"></pre>
+      </div>
     </section>
   </div>
 

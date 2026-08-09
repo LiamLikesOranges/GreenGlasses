@@ -1,0 +1,20 @@
+{
+  "name": "GreenGlasses",
+  "version": 1,
+  "folder": "GreenGlasses-v1-826.4K",
+  "size_tag": "826.4K",
+  "num_params": 826368,
+  "iteration": 3000,
+  "max_iters": null,
+  "config": {
+    "vocab_size": 65,
+    "n_embed": 128,
+    "n_head": 4,
+    "n_layer": 4,
+    "block_size": 128,
+    "dropout": 0.1
+  },
+  "description": "Migrated automatically from an earlier version of greenglasses that stored a single checkpoint instead of per-model folders.",
+  "created_at": "2026-08-09T00:37:03.821447+00:00",
+  "updated_at": "2026-08-09T00:37:03.821489+00:00"
+}

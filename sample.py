@@ -1,168 +1,128 @@
 """
-A GPT-style transformer, written from scratch (only using PyTorch's basic
-building blocks — nn.Linear, nn.Embedding, nn.LayerNorm — not a prebuilt
-transformer module). This is the actual architecture behind every modern
-LLM, just small.
+Generate text from a trained greenglasses model.
 
-Rough shape of the model for one input sequence:
+By default, uses whichever model under models/ was trained/updated most
+recently. Pass --model to pick a specific one by folder name.
 
-  tokens -> [token embedding + position embedding] -> N x TransformerBlock
-          -> final layer norm -> linear layer -> next-token probabilities
-
-Each TransformerBlock is:
-
-  x -> layer norm -> self-attention -> add back to x (residual)
-    -> layer norm -> feed-forward   -> add back to x (residual)
-
-Self-attention is the key idea: it lets every position in the sequence
-look at every earlier position (this one is "causal" / can't peek ahead)
-and decide, via learned weights, which earlier characters are relevant
-to predicting the next one.
+Usage:
+    python sample.py --prompt "ROMEO:"
+    python sample.py --model "GreenGlasses-v2-0.8M" --prompt "ROMEO:"
+    python sample.py --list                              # show available models
 """
 
-import math
+import argparse
+import os
+import time
 
 import torch
-import torch.nn as nn
-from torch.nn import functional as F
+
+import config
+import model_registry
+from model import GreenGlassesGPT
+from tokenizer import CharTokenizer
 
 
-class CausalSelfAttention(nn.Module):
-    """Multi-head self-attention where each position can only attend to
-    itself and earlier positions (causal = no peeking at the future)."""
-
-    def __init__(self, n_embed, n_head, block_size, dropout):
-        super().__init__()
-        assert n_embed % n_head == 0, "n_embed must be divisible by n_head"
-        self.n_head = n_head
-        self.head_size = n_embed // n_head
-
-        # one linear layer produces query, key, and value all at once
-        self.qkv_proj = nn.Linear(n_embed, 3 * n_embed)
-        self.out_proj = nn.Linear(n_embed, n_embed)
-
-        self.attn_dropout = nn.Dropout(dropout)
-        self.resid_dropout = nn.Dropout(dropout)
-
-        # causal mask: position i can only attend to positions <= i
-        mask = torch.tril(torch.ones(block_size, block_size))
-        self.register_buffer("mask", mask.view(1, 1, block_size, block_size))
-
-    def forward(self, x):
-        B, T, C = x.shape  # batch, sequence length, embedding dim
-
-        qkv = self.qkv_proj(x)  # (B, T, 3*C)
-        q, k, v = qkv.split(C, dim=2)
-
-        # reshape into (B, n_head, T, head_size) so each head attends independently
-        q = q.view(B, T, self.n_head, self.head_size).transpose(1, 2)
-        k = k.view(B, T, self.n_head, self.head_size).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_size).transpose(1, 2)
-
-        # scaled dot-product attention scores
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_size)
-        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-
-        out = att @ v  # (B, n_head, T, head_size)
-        out = out.transpose(1, 2).contiguous().view(B, T, C)  # recombine heads
-        out = self.resid_dropout(self.out_proj(out))
-        return out
+def get_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
-class FeedForward(nn.Module):
-    """Simple two-layer MLP applied to each position independently."""
+def main():
+    parser = argparse.ArgumentParser(description="Generate text from a trained greenglasses model")
+    parser.add_argument("--prompt", type=str, default="\n", help="Prompt text to start generation from.")
+    parser.add_argument(
+        "--max_new_tokens", type=int, default=config.DEFAULT_MAX_NEW_TOKENS,
+        help="How many characters to generate.",
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=config.DEFAULT_TEMPERATURE,
+        help="Sampling temperature (higher = more random).",
+    )
+    parser.add_argument("--top_k", type=int, default=config.DEFAULT_TOP_K, help="Top-K sampling cutoff.")
+    parser.add_argument(
+        "--model", type=str, default=None,
+        help="Folder name under models/ to load, e.g. 'GreenGlasses-v1-0.8M'. "
+             "Defaults to the most recently trained model.",
+    )
+    parser.add_argument(
+        "--list", action="store_true",
+        help="List available trained models under models/ and exit.",
+    )
+    args = parser.parse_args()
 
-    def __init__(self, n_embed, dropout):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embed, 4 * n_embed),
-            nn.GELU(),
-            nn.Linear(4 * n_embed, n_embed),
-            nn.Dropout(dropout),
+    if args.list:
+        folders = model_registry.list_model_folders(config.MODELS_DIR)
+        if not folders:
+            print("No trained models found in models/. Run `python train.py` first.")
+        else:
+            print("Available models (newest first):")
+            for name in folders:
+                info = model_registry.read_model_info(os.path.join(config.MODELS_DIR, name))
+                iteration = info.get("iteration") if info else "?"
+                print(f"  {name}  (iter {iteration})")
+        return
+
+    model_name = args.model
+    if model_name is None:
+        model_name = model_registry.find_latest_model_folder(config.MODELS_DIR)
+        if model_name is None:
+            raise FileNotFoundError(
+                f"No trained models found in {config.MODELS_DIR}. Run `python train.py` first."
+            )
+        print(f"No --model specified, using most recent: {model_name}")
+
+    folder_path = os.path.join(config.MODELS_DIR, model_name)
+    checkpoint_path = os.path.join(folder_path, "model.pt")
+    tokenizer_path = os.path.join(folder_path, "tokenizer.json")
+
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(
+            f"No model.pt found at {checkpoint_path}. "
+            f"Run `python sample.py --list` to see available models."
         )
 
-    def forward(self, x):
-        return self.net(x)
+    device = get_device()
+    print(f"Using device: {device}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint_config = checkpoint["config"]
+    tokenizer = CharTokenizer.load(tokenizer_path)
+
+    model = GreenGlassesGPT(
+        vocab_size=checkpoint_config["vocab_size"],
+        n_embed=checkpoint_config["n_embed"],
+        n_head=checkpoint_config["n_head"],
+        n_layer=checkpoint_config["n_layer"],
+        block_size=checkpoint_config["block_size"],
+        dropout=checkpoint_config["dropout"],
+    ).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    prompt_ids = tokenizer.encode(args.prompt)
+    if len(prompt_ids) == 0:
+        raise ValueError("Prompt cannot be empty.")
+    if len(prompt_ids) > checkpoint_config["block_size"]:
+        prompt_ids = prompt_ids[-checkpoint_config["block_size"]:]
+
+    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    start_time = time.time()
+    output_ids = model.generate(
+        input_ids,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+    )
+    elapsed = time.time() - start_time
+
+    text = tokenizer.decode(output_ids[0].tolist())
+    print("\n=== Generated Text ===\n")
+    print(text)
+    print(f"\n[generated {args.max_new_tokens} chars in {elapsed:.2f}s using {model_name}]")
 
 
-class TransformerBlock(nn.Module):
-    def __init__(self, n_embed, n_head, block_size, dropout):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(n_embed)
-        self.attn = CausalSelfAttention(n_embed, n_head, block_size, dropout)
-        self.ln2 = nn.LayerNorm(n_embed)
-        self.ff = FeedForward(n_embed, dropout)
-
-    def forward(self, x):
-        # residual connections: add the sublayer's output back to its input.
-        # this keeps gradients flowing well in deep networks.
-        x = x + self.attn(self.ln1(x))
-        x = x + self.ff(self.ln2(x))
-        return x
-
-
-class GreenGlassesGPT(nn.Module):
-    def __init__(self, vocab_size, n_embed, n_head, n_layer, block_size, dropout):
-        super().__init__()
-        self.block_size = block_size
-
-        self.token_embedding = nn.Embedding(vocab_size, n_embed)
-        self.position_embedding = nn.Embedding(block_size, n_embed)
-        self.dropout = nn.Dropout(dropout)
-
-        self.blocks = nn.Sequential(
-            *[TransformerBlock(n_embed, n_head, block_size, dropout) for _ in range(n_layer)]
-        )
-        self.ln_final = nn.LayerNorm(n_embed)
-        self.lm_head = nn.Linear(n_embed, vocab_size, bias=False)
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
-        assert T <= self.block_size, f"sequence length {T} exceeds block_size {self.block_size}"
-
-        tok_emb = self.token_embedding(idx)  # (B, T, C)
-        pos_emb = self.position_embedding(torch.arange(T, device=idx.device))  # (T, C)
-        x = self.dropout(tok_emb + pos_emb)
-
-        x = self.blocks(x)
-        x = self.ln_final(x)
-        logits = self.lm_head(x)  # (B, T, vocab_size)
-
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-
-        return logits, loss
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=0.8, top_k=None):
-        """Autoregressively generate new tokens, one at a time, feeding each
-        prediction back in as input for the next step."""
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.block_size:]  # crop to context window
-            logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] / max(temperature, 1e-5)  # last position only
-
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = float("-inf")
-
-            probs = F.softmax(logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, next_id), dim=1)
-        return idx
-
-    def num_params(self):
-        return sum(p.numel() for p in self.parameters())
+if __name__ == "__main__":
+    main()

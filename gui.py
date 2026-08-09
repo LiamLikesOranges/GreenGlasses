@@ -32,11 +32,13 @@ double-clicking) so you can see the error — a startup crash before
 window.show() closes instantly otherwise.
 """
 
+import json
 import os
 import re
 import sys
 import traceback
 
+import model_registry
 from PySide6.QtCore import QObject, QProcess, QUrl, Signal, Slot
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -45,6 +47,9 @@ from PySide6.QtWidgets import QApplication, QMainWindow
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(PROJECT_ROOT, "web")
 INDEX_HTML = os.path.join(WEB_DIR, "index.html")
+MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
+LEGACY_CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, "checkpoints", "greenglasses.pt")
+LEGACY_TOKENIZER_PATH = os.path.join(PROJECT_ROOT, "checkpoints", "tokenizer.json")
 
 # Try to read MAX_ITERS from config.py so the progress bar knows the total.
 try:
@@ -55,6 +60,7 @@ except Exception:
     DEFAULT_MAX_ITERS = 3000
 
 STEP_LINE_RE = re.compile(r"step\s+(\d+)\s*\|")
+DOWNLOAD_PROGRESS_RE = re.compile(r"DOWNLOAD_PROGRESS:([\d.]+)")
 
 STAGE_INFO = {
     "prepare": ("Preparing data", [os.path.join(PROJECT_ROOT, "data", "prepare.py")]),
@@ -75,6 +81,9 @@ class Bridge(QObject):
     @Slot here becomes a function JS can call (bridge.runStage(...))."""
 
     logLine = Signal(str)
+    internalLogLine = Signal(str)
+    modelListChanged = Signal(str)
+    modelDetailsChanged = Signal(str)
     statusChanged = Signal(str)
     progressChanged = Signal(int)
     progressMax = Signal(int)
@@ -88,6 +97,9 @@ class Bridge(QObject):
         self.queue = []
         self.current_label = None
 
+    def _log_internal(self, message: str):
+        self.internalLogLine.emit(f"[gui] {message}\n")
+
     @Slot(str)
     def runStage(self, stage_group):
         if self.process is not None:
@@ -100,6 +112,7 @@ class Bridge(QObject):
             return
 
         self.queue = [STAGE_INFO[n] for n in names]
+        self._log_internal(f"Requested stage group '{stage_group}' -> {', '.join(names)}")
         self.progressMax.emit(DEFAULT_MAX_ITERS)
         self.progressChanged.emit(0)
         self.pipelineStarted.emit()
@@ -108,6 +121,7 @@ class Bridge(QObject):
     @Slot()
     def stopStage(self):
         self.queue = []
+        self._log_internal("Stop requested by user")
         if self.process is not None:
             self.process.kill()
         self.statusChanged.emit("Stopped")
@@ -117,6 +131,65 @@ class Bridge(QObject):
     @Slot(result=int)
     def getMaxIters(self):
         return DEFAULT_MAX_ITERS
+
+    @Slot()
+    def refreshModelList(self):
+        self._log_internal("Refreshing trained model list")
+        self._maybe_migrate_legacy_checkpoint()
+        self._emit_model_list()
+
+    @Slot(str)
+    def requestModelDetails(self, folder_name):
+        self._log_internal(f"Requesting details for {folder_name}")
+        self._emit_model_details(folder_name)
+
+    def _maybe_migrate_legacy_checkpoint(self):
+        """One-time upgrade: older versions of greenglasses saved a single
+        checkpoints/greenglasses.pt that got overwritten every training
+        run. If that layout is found and models/ is otherwise empty, copy
+        it into the new per-model-folder layout so it doesn't just vanish."""
+        try:
+            migrated = model_registry.migrate_legacy_checkpoint(
+                LEGACY_CHECKPOINT_PATH, LEGACY_TOKENIZER_PATH, MODELS_DIR,
+            )
+            if migrated:
+                self._log_internal(f"Migrated legacy checkpoint -> models/{migrated}")
+        except Exception as e:
+            self._log_internal(f"Legacy checkpoint migration failed (non-fatal): {e}")
+
+    def _emit_model_list(self):
+        folders = model_registry.list_model_folders(MODELS_DIR)
+        models = []
+        for folder_name in folders:
+            info = model_registry.read_model_info(os.path.join(MODELS_DIR, folder_name))
+            if info is None:
+                # model.pt exists but info.json doesn't/couldn't be read —
+                # still show it, just with less detail, rather than hiding it
+                info = {"folder": folder_name}
+            models.append({
+                "name": info.get("folder", folder_name),
+                "display_name": info.get("name", folder_name),
+                "version": info.get("version"),
+                "size_tag": info.get("size_tag"),
+                "iter": info.get("iteration"),
+                "max_iters": info.get("max_iters"),
+                "num_params": info.get("num_params"),
+                "description": info.get("description"),
+                "created_at": info.get("created_at"),
+                "updated_at": info.get("updated_at"),
+                "config": info.get("config", {}),
+            })
+        self._log_internal(f"Found {len(models)} model(s) in models/")
+        self.modelListChanged.emit(json.dumps(models))
+
+    def _emit_model_details(self, folder_name):
+        info = model_registry.read_model_info(os.path.join(MODELS_DIR, folder_name))
+        if info is None:
+            self.modelDetailsChanged.emit(json.dumps({"error": "Could not read model info."}))
+            return
+        details = dict(info)
+        details["checkpoint_path"] = os.path.join(MODELS_DIR, folder_name, "model.pt")
+        self.modelDetailsChanged.emit(json.dumps(details))
 
     def _run_next(self):
         if not self.queue:
@@ -130,16 +203,33 @@ class Bridge(QObject):
         self.statusChanged.emit(f"{label} ...")
         self.logLine.emit(f"\n=== {label} ===\n")
 
+        # each stage has its own progress scale: training counts steps up
+        # to MAX_ITERS, preparing counts download percent (0-100), and
+        # sampling has no measurable progress at all (stays indeterminate).
+        if label == "Training model":
+            self.progressMax.emit(DEFAULT_MAX_ITERS)
+        elif label == "Preparing data":
+            self.progressMax.emit(100)
+        self.progressChanged.emit(0)
+
         self.process = QProcess()
         self.process.setProcessChannelMode(QProcess.MergedChannels)
         self.process.setWorkingDirectory(PROJECT_ROOT)
         self.process.readyReadStandardOutput.connect(self._read_output)
         self.process.finished.connect(self._stage_finished)
-        self.process.start(sys.executable, args)
+        self.process.started.connect(self._process_started)
+        self.process.errorOccurred.connect(self._process_error)
+        # "-u" = unbuffered stdout/stderr. Without this, Python buffers
+        # print() output when it's not attached to a real terminal (like
+        # here, where QProcess pipes it), so nothing shows up in the log
+        # until the whole script finishes — which looks exactly like it's
+        # frozen even when it's working.
+        self.process.start(sys.executable, ["-u"] + args)
 
     def _read_output(self):
         data = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
         self.logLine.emit(data)
+        self._log_internal(f"Process output received ({len(data)} chars)")
 
         if self.current_label == "Training model":
             match = None
@@ -148,18 +238,40 @@ class Bridge(QObject):
             if match:
                 step = int(match.group(1))
                 self.progressChanged.emit(min(step, DEFAULT_MAX_ITERS))
+                self._log_internal(f"Detected training step {step}")
+
+        elif self.current_label == "Preparing data":
+            match = None
+            for match in DOWNLOAD_PROGRESS_RE.finditer(data):
+                pass
+            if match:
+                percent = float(match.group(1))
+                # download progress is a 0-100 percent, not a step count —
+                # switch the bar's scale to match while this stage runs
+                self.progressMax.emit(100)
+                self.progressChanged.emit(int(percent))
+                self._log_internal(f"Download progress: {percent:.1f}%")
 
     def _stage_finished(self, exit_code, exit_status):
         proc = self.process
         self.process = None
+        self._log_internal(f"Stage process finished with exit code {exit_code}")
         if exit_code != 0:
             self.logLine.emit(f"\n[gui] Stage failed (exit code {exit_code}). Stopping pipeline.\n")
             self.queue = []
             self.statusChanged.emit("Failed")
             self.pipelineFailed.emit(self.current_label or "stage")
             return
+        if self.current_label == "Training model":
+            self._emit_model_list()
         proc.deleteLater()
         self._run_next()
+
+    def _process_started(self):
+        self._log_internal(f"Subprocess started for: {self.current_label}")
+
+    def _process_error(self, qprocess_error):
+        self._log_internal(f"Subprocess error occurred: {qprocess_error}")
 
 
 class MainWindow(QMainWindow):
