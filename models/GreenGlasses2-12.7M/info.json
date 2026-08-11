@@ -1,0 +1,20 @@
+{
+  "name": "GreenGlasses2hotfix",
+  "version": 4,
+  "folder": "GreenGlasses2hotfix-v4-12.7M",
+  "size_tag": "12.7M",
+  "num_params": 12735488,
+  "iteration": 6000,
+  "max_iters": 6000,
+  "config": {
+    "vocab_size": 65,
+    "n_embed": 256,
+    "n_head": 8,
+    "n_layer": 16,
+    "block_size": 256,
+    "dropout": 0.1
+  },
+  "description": "Character-level GPT trained on 1,115,394 characters of text.",
+  "created_at": "2026-08-09T08:21:02.812389+00:00",
+  "updated_at": "2026-08-09T10:15:58.350125+00:00"
+}

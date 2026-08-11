@@ -1,0 +1,20 @@
+{
+  "name": "OrangeGlasses",
+  "version": 1,
+  "folder": "OrangeGlasses-v1-1.7M",
+  "size_tag": "1.7M",
+  "num_params": 1665536,
+  "iteration": 5000,
+  "max_iters": 5000,
+  "config": {
+    "vocab_size": 181,
+    "n_embed": 128,
+    "n_head": 4,
+    "n_layer": 8,
+    "block_size": 256,
+    "dropout": 0.1
+  },
+  "description": "Character-level GPT trained on 500,000 characters of text.",
+  "created_at": "2026-08-09T13:22:38.189943+00:00",
+  "updated_at": "2026-08-09T14:00:05.945678+00:00"
+}
